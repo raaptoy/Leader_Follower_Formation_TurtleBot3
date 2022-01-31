@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+import time
+import sys
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from threading import Thread
+
+# Other Imports
+import numpy as np
+import math as m
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+max_linear_velocity = 0.22
+max_angular_velocity = 2.84
+
+
+def scale_angle(angle):
+    if(angle > m.pi):
+	    angle = angle - m.pi * 2
+    elif(angle < -m.pi):
+	    angle = angle + m.pi * 2
+    return angle
+
+def derivada(var1, var2, var3, var4, current_time=None):
+    global sample_time, last_time, ultima_var1, isNewData, vlp, ultima_var2, wlp
+    global ultima_var3, elp, ultima_var4, ephip
+    current_time = current_time if current_time is not None else time.time()
+    delta_time = current_time - last_time
+
+    delta_var1 = var1 - ultima_var1
+    delta_var2 = var2 - ultima_var2
+    delta_var3 = var3 - ultima_var3
+    delta_var4 = var4 - ultima_var4
+
+
+    if (delta_time >= sample_time):
+        if delta_time > 0:
+            vlp = delta_var1 / delta_time
+            wlp = delta_var2 / delta_time 
+            elp = delta_var3 / delta_time 
+            ephip = delta_var4 / delta_time 
+        # Remember last time and last error for next calculation
+            print("----------------")
+            print("Delta time: ", delta_time)
+            #print("Ultima variable:  ", )
+            print("Derivada wlp:  ", wlp)
+            print("Derivada vlp: ", vlp)
+            print("Derivada elp: ", elp)
+            print("Derivada ephip: ", ephip)
+        
+        last_time = current_time
+        ultima_var1 = var1
+        ultima_var2 = var2
+        ultima_var3 = var3
+        ultima_var4 = var4
+
+
+    return 
+
+
+def auto(pub):
+    global pose_and_orient1, pose_and_orient2, rate, vel2, isNewData, vj, wj 
+    global velocidad_actual_L, velocidad_anterior_L, ktp, kvp, vlp, wlp, ld, phid
+    global elp, ephip, klp, kphid, kphip 
+
+    isNewData = False
+#------------------X Y THETA ROBOT LIDER ---------------------- 
+    pose1 = pose_and_orient1.pose.pose.position
+    orient1 = pose_and_orient1.pose.pose.orientation
+    _, _, yaw1 = euler_from_quaternion([orient1.x, orient1.y, orient1.z, orient1.w])
+    theta1 = yaw1
+
+    #------------------X Y THETA Vel lineal ROBOT SEGUIDOR ---------------------- 
+    pose2 = pose_and_orient2.pose.pose.position
+    orient2 = pose_and_orient2.pose.pose.orientation
+    _, _, yaw2 = euler_from_quaternion([orient2.x, orient2.y, orient2.z, orient2.w])
+    theta2 = yaw2
+    vi_real=pose_and_orient2.twist.twist.linear.x #Velocidad lineal del robot
+    
+    #Càlculo de la aceleraciòn del robot lìder
+    #velocidad_actual_L=vj
+    #vlp=(velocidad_actual_L-velocidad_anterior_L)/(0.02)
+    #vlp = derivada(vj) #Derivada del robot lider (aceleraciòn)
+    
+    
+    #Cálculo de velocidades robot seguidor
+
+    # Si velocidad del seguidor (vi) >= delta----------------------------------------
+    ly= -(pose1.y-pose2.y)*np.cos(theta1) + (pose1.x-pose2.x)*np.sin(theta1)
+    lx= -(pose1.y-pose2.y)*np.sin(theta1) - (pose1.x-pose2.x)*np.cos(theta1)
+    l = m.sqrt((pose1.x - pose2.x)**2 + (pose1.y - pose2.y)**2) #Càlculo de la distancia con respecto al lider
+    phi=m.atan2(ly,lx) #Cálculo del ángulo con respecto al lider
+    phi = scale_angle(phi)
+    
+    #Cálculo de errores
+    ephi=phi-phid #Error de ángullo
+    el=l-ld       #Eroor de distancia
+    ev=vi_real-vj #Error de velocidad = velocidad del seguidor - velocidad del lider
+    et=theta2-theta1 #Error de orientación = àngulo del seguidor - ángulo  del lider (radianes)
+
+    derivada(vj, wj, el, ephi) #Cálculo de derivadas
+
+
+    a1 = vlp*np.cos(phi) + vj*wj*np.sin(phi) + (1/l)*(vj*np.sin(phi)+vi_real*np.sin(et-phi))**2
+    a2 = (1/l)*(-vlp*np.sin(phi)+vj*wj*np.cos(phi)) + (1/l**2)*((vj**2)*np.sin(2*phi) - (vi_real**2)*(np.sin(2*(et-phi))) + 2*vi_real*vj*np.sin(et-2*phi))
+    fh = np.array([[a1],[-wlp+a2]]) 
+    
+    gh = np.array([[-np.cos(et-phi), vi_real*np.sin(et-phi) ],[-(np.sin(et-phi))/l , -(vi_real*np.cos(et-phi))/l ]]) 
+    
+    eh= np.array([[-klp*el-klp*elp],[-kphip*ephi-kphid*ephip]])
+    sumh = -fh+eh
+
+    ghin = np.linalg.inv(gh)
+    C = m.cos(45)
+    D=np.cos(45)
+    V = np.dot(ghin, sumh)
+
+    # Si velocidad del seguidor (vi) < delta----------------------------------------
+    vi = vlp - kvp*ev #Velocidad lineal robot seguidir
+    wi = wj - ktp*et  # Velocidad angular robot seguidor
+
+
+    #velocidad_anterior_L = velocidad_actual_L
+
+    if isNewData:
+        print("----------------")
+        print("Velocidad vi: ", vi)
+        print("Velocidad vi_real: ", vi_real)
+        print("Velocidad vj:  ", vj)
+        print("Velocidad wi: ", wi)
+        print("---------FH-------")
+        print(fh)
+        print("---------GH-------")
+        print(gh)
+        print("---------GH Inversa-------")
+        print(ghin)
+        print("---------EH-------")
+        print(eh)
+        print("---------Suma H-------")
+        print(sumh)
+        print("---------V-------")
+        print(V)
+        print("---------C-------")
+        print(C)
+        print("---------D-------")
+        print(D)
+
+        #print("delta time: ", delta_time)
+
+    if vi>max_linear_velocity:
+        vi = max_linear_velocity
+    if wi>max_angular_velocity:
+        wi=max_angular_velocity
+
+    vel2.linear.x, vel2.linear.y, vel2.linear.z = vi, 0, 0
+    vel2.angular.x, vel2.angular.y, vel2.angular.z = 0, 0, wi
+        # rospy.loginfo("Linear Velocity: %f Angular Velocity:
+        # %\n",vel.linear.x,vel.angular.z)
+    pub2.publish(vel2)
+    return
+
+
+def callback1(data):
+    global pose_and_orient1
+    pose_and_orient1 = data
+    global isNewData
+    isNewData = True
+    return
+
+
+def callback2(data):
+    global pose_and_orient2
+    pose_and_orient2 = data
+    return
+
+
+def callback3(data):
+    global vj, wj 
+    vj = data.linear.x   # Velocidad lineal del robot lider
+    wj= data.angular.z   # Velocidad angular del robot lider
+    return
+
+
+if __name__ == "__main__":
+	
+    vj=0
+    wj=0
+    # initialize node and create publisher and subscriber
+    rospy.init_node('follower', anonymous=True)
+    pub2 = rospy.Publisher('robot2/cmd_vel', Twist, queue_size=10)
+    sub1 = rospy.Subscriber("robot1/odom", Odometry, callback1)
+    sub2 = rospy.Subscriber("robot2/odom", Odometry, callback2)
+    sub3 = rospy.Subscriber("robot1/cmd_vel", Twist, callback3)
+    rate = rospy.Rate(10)
+	
+    vel2 = Twist()
+    
+    pose_and_orient1 = Odometry()
+    pose_and_orient2 = Odometry()
+
+    #INICIALIZACIÒN DE CONSTANTES
+    ktp=5
+    kvp=5
+    velocidad_actual_L = 0
+    velocidad_anterior_L = 0
+    ld=0.4
+    phid=0
+    klp=100
+    kphip=0.2
+    kphid=0.5
+
+    #Inicializar constantes derivada 
+    #current_time=None
+    sample_time = 0.1
+    #current_time = current_time if current_time is not None else time.time()
+    last_time = 0
+    ultima_var1 = 0
+    ultima_var2 = 0
+    ultima_var3 = 0
+    ultima_var4 = 0
+    vlp=0 #Derivada velocidad lineal del lider
+    wlp=0 #Derivada velocidad angular del lider
+    elp=0 #Derivada del error de distancia
+    ephip=0 #Derivada del error de ángulo
+
+    while not rospy.is_shutdown():
+        auto_thread = Thread(target=auto,args=(pub2,))
+        auto_thread.start()
+        #auto(pub2)
+        #mode = input()
+        #if mode == 'e':
+        #    break;
+    vel2.linear.x, vel2.linear.y, vel2.linear.z = 0, 0, 0
+    vel2.angular.x, vel2.angular.y, vel2.angular.z = 0, 0, 0

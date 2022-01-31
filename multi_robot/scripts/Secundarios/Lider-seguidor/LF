@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+# Import Utilities
+import rps.robotarium as robotarium
+from rps.utilities.transformations import *
+from rps.utilities.graph import *
+from rps.utilities.barrier_certificates import *
+from rps.utilities.misc import *
+from rps.utilities.controllers import *
+
+# Other Imports
+import numpy as np
+import math as m
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+# Experiment Constants
+# Run the simulation/experiment for 5000 steps (5000*0.033 ~= 2min 45sec)
+iterations = 5000
+# Number of robots to use, this must stay 4 unless the Laplacian is changed.
+N = 4
+
+# Waypoints the leader moves to.
+waypoints = np.array([[3, 3, 5, 5], [2, 4, 4, 2]])
+# How close the leader must get to the waypoint to move to the next one.
+close_enough = 0.03
+
+# Create the desired Laplacian
+followers = -completeGL(N-1)
+L = np.zeros((N, N))
+L[1:N, 1:N] = followers
+L[1, 1] = L[1, 1] + 1
+L[1, 0] = -1
+
+# Find connections
+[rows, cols] = np.where(L == 1)
+
+# For computational/memory reasons, initialize the velocity vector
+dxi = np.zeros((2, N))
+
+# Initialize leader state
+state = 0
+
+# Limit maximum linear speed of any robot
+magnitude_limit = 0.2
+
+# Create gains for our formation control algorithm
+formation_control_gain = 20
+desired_distance = 0.3
+
+# Initial Conditions to Avoid Barrier Use in the Beginning.
+initial_conditions = np.array([[1, 1, 1, 2], [1, 2, 3, 1], [0, 0, 0, 0]])
+#initial_conditions = np.array([[0, 0.5, 0.3, -0.1],[0.5, 0.5, 0.2, 0],[0, 0, 0, 0]])
+
+# Instantiate the Robotarium object with these parameters
+r = robotarium.Robotarium(number_of_robots=N, show_figure=True, initial_conditions=initial_conditions, sim_in_real_time=True)
+
+# Single-integrator -> unicycle dynamics mapping
+_, uni_to_si_states = create_si_to_uni_mapping()
+si_to_uni_dyn = create_si_to_uni_dynamics()
+# Single-integrator barrier certificates
+si_barrier_cert = create_single_integrator_barrier_certificate_with_boundary()
+# Single-integrator position controller
+leader_controller = create_si_position_controller(velocity_magnitude_limit=0.2)
+
+
+def callback1(data):
+    global pose_and_orient1
+    pose_and_orient1 = data
+    return
+
+
+def callback2(data):
+    global pose_and_orient2
+    pose_and_orient2 = data
+    return
+
+
+def callback3(data):
+    global pose_and_orient3
+    pose_and_orient3 = data
+    return
+
+def callback4(data):
+    global pose_and_orient4
+    pose_and_orient4 = data
+    return
+
+max_linear_velocity = 0.22
+max_angular_velocity = 2.84
+velocities = np.zeros((2, N))
+
+def set_velocities( ids, velocities):
+
+    # Threshold linear velocities
+    idxs = np.where(np.abs(velocities[0, :]) > max_linear_velocity)
+    velocities[0, idxs] = max_linear_velocity*np.sign(velocities[0, idxs])
+
+    # Threshold angular velocities
+    idxs = np.where(np.abs(velocities[1, :]) > max_angular_velocity)
+    velocities[1, idxs] = max_angular_velocity*np.sign(velocities[1, idxs])
+    return velocities
+
+
+if __name__ == "__main__":
+
+    rospy.init_node('Leader_Follower')
+    pub1 = rospy.Publisher('robot1/cmd_vel', Twist, queue_size=10)
+    pub2 = rospy.Publisher('robot2/cmd_vel', Twist, queue_size=10)
+    pub3 = rospy.Publisher('robot3/cmd_vel', Twist, queue_size=10)
+    pub4 = rospy.Publisher('robot4/cmd_vel', Twist, queue_size=10)
+
+    sub1 = rospy.Subscriber("robot1/odom", Odometry, callback1)
+    sub2 = rospy.Subscriber("robot2/odom", Odometry, callback2)
+    sub3 = rospy.Subscriber("robot3/odom", Odometry, callback3)
+    sub4 = rospy.Subscriber("robot4/odom", Odometry, callback3)
+    rate = rospy.Rate(10)
+
+    vel1 = Twist()
+    vel2 = Twist()
+    vel3 = Twist()
+    vel4 = Twist()
+    pose_and_orient1 = Odometry()
+    pose_and_orient2 = Odometry()
+    pose_and_orient3 = Odometry()
+    pose_and_orient4 = Odometry()
+
+
+    # -------------Algoritmo------------
+    for t in range(iterations):
+
+        # Get the most recent pose
+        r.get_poses()
+        pose1 = pose_and_orient1.pose.pose.position
+        pose2 = pose_and_orient2.pose.pose.position
+        pose3 = pose_and_orient3.pose.pose.position
+        pose4 = pose_and_orient4.pose.pose.position
+
+        orient1 = pose_and_orient1.pose.pose.orientation
+        orient2 = pose_and_orient2.pose.pose.orientation
+        orient3 = pose_and_orient3.pose.pose.orientation
+        orient4 = pose_and_orient4.pose.pose.orientation
+
+        _, _, yaw1 = euler_from_quaternion(
+            [orient1.x, orient1.y, orient1.z, orient1.w])
+        theta1 = yaw1
+        _, _, yaw2 = euler_from_quaternion(
+            [orient2.x, orient2.y, orient2.z, orient2.w])
+        theta2 = yaw2
+        _, _, yaw3 = euler_from_quaternion(
+            [orient3.x, orient3.y, orient3.z, orient3.w])
+        theta3 = yaw3
+
+        _, _, yaw4 = euler_from_quaternion(
+            [orient4.x, orient4.y, orient4.z, orient4.w])
+        theta4 = yaw4
+
+        x = np.array([[pose1.x, pose2.x, pose3.x, pose4.x], [
+                     pose1.y, pose2.y, pose3.y, pose4.y], [theta1, theta2, theta3, theta4]])
+        
+
+        xi = uni_to_si_states(x)
+
+        # Algorithm
+
+        # Followers
+        for i in range(1, N):
+            # Zero velocities and get the topological neighbors of agent i
+            dxi[:, [i]] = np.zeros((2, 1))
+            neighbors = topological_neighbors(L, i)
+
+            for j in neighbors:
+                dxi[:, [i]] += formation_control_gain*(np.power(np.linalg.norm(
+                    x[:2, [j]]-x[:2, [i]]), 2)-np.power(desired_distance, 2))*(x[:2, [j]]-x[:2, [i]])
+
+        # Leader
+        waypoint = waypoints[:, state].reshape((2, 1))
+
+        dxi[:, [0]] = leader_controller(x[:2, [0]], waypoint)
+        if np.linalg.norm(x[:2, [0]] - waypoint) < close_enough:
+            state = (state + 1) % 4
+
+        # Keep single integrator control vectors under specified magnitude
+        # Threshold control inputs
+        norms = np.linalg.norm(dxi, 2, 0)
+        idxs_to_normalize = (norms > magnitude_limit)
+        dxi[:, idxs_to_normalize] *= magnitude_limit/norms[idxs_to_normalize]
+
+        # Use barriers and convert single-integrator to unicycle commands
+        dxi = si_barrier_cert(dxi, x[:2, :])
+        dxu = si_to_uni_dyn(dxi, x)
+        #print("dxu")
+        #print(dxu)
+        # Set the velocities of agents 1,...,N to dxu
+
+        velocidades = set_velocities(np.arange(N), dxu)
+        #velocidades = velocidades.astype(type('float', (float,), {}))
+        #v1x velocidad lineal 1 en x
+        #v1az velocidad angular 1 en z
+        v1x = velocidades[0,0]
+        v1x = v1x.astype(type('float', (float,), {}))
+        v2x = velocidades[0,1]
+        v2x = v2x.astype(type('float', (float,), {}))
+        v3x = velocidades[0,2]
+        v3x = v3x.astype(type('float', (float,), {}))
+        v4x = velocidades[0,3]
+        v4x = v4x.astype(type('float', (float,), {}))
+
+        v1az = velocidades[1,0]
+        v1az = v1az.astype(type('float', (float,), {}))
+        v2az = velocidades[1,1]
+        v2az = v2az.astype(type('float', (float,), {}))
+        v3az = velocidades[1,2]
+        v3az = v3az.astype(type('float', (float,), {}))                
+        v4az = velocidades[1,3]
+        v4az = v4az.astype(type('float', (float,), {}))
+
+        vel1.linear.x = v1x; vel1.linear.y = 0.0; vel1.linear.z = 0.0
+        vel2.linear.x = v2x; vel2.linear.y = 0.0; vel2.linear.z = 0.0
+        vel3.linear.x = v3x; vel3.linear.y = 0.0; vel3.linear.z = 0.0
+        vel4.linear.x = v4x; vel4.linear.y = 0.0; vel4.linear.z = 0.0
+
+        vel1.angular.x = 0.0; vel1.angular.y = 0.0; vel1.angular.z = v1az
+        vel2.angular.x = 0.0; vel2.angular.y = 0.0; vel1.angular.z = v2az
+        vel3.angular.x = 0.0; vel3.angular.y = 0.0; vel1.angular.z = v3az
+        vel4.angular.x = 0.0; vel4.angular.y = 0.0; vel1.angular.z = v4az
+
+        pub1.publish(vel1)
+        pub2.publish(vel2)
+        pub3.publish(vel3)
+        pub4.publish(vel4)
+
+        r.step()
+    # Call at end of script to print debug information and for your script to run on the Robotarium server properly
+    # r.call_at_scripts_end()
+
+    #rospy.spin()

@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from threading import Thread
+
+# Other Imports
+import numpy as np
+import math as m
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+max_linear_velocity = 0.22
+max_angular_velocity = 2.84
+
+
+def scale_angle(angle):
+    if(angle > m.pi):
+	    angle = angle - m.pi * 2
+    elif(angle < -m.pi):
+	    angle = angle + m.pi * 2
+    return angle
+
+
+def auto(pub):
+    global pose_and_orient1, pose_and_orient2, rate, vel2, isNewData, vj, Kw, phiref,dref,Kv
+
+    isNewData = False
+    #------------------X Y THETA ROBOT LIDER ---------------------- 
+    pose1 = pose_and_orient1.pose.pose.position
+    orient1 = pose_and_orient1.pose.pose.orientation
+    _, _, yaw1 = euler_from_quaternion([orient1.x, orient1.y, orient1.z, orient1.w])
+    theta1 = yaw1 # Ángulo del robot lider en radianes 
+
+    #------------------X Y THETA ROBOT SEGUIDOR ---------------------- 
+    pose2 = pose_and_orient2.pose.pose.position
+    orient2 = pose_and_orient2.pose.pose.orientation
+    vi_real=pose_and_orient2.twist.twist.linear.x
+    _, _, yaw2 = euler_from_quaternion([orient2.x, orient2.y, orient2.z, orient2.w])
+    theta2 = yaw2
+    #-------------------LÓGICA DE CONTROL -------------------------------
+    
+    d = m.sqrt((pose1.x - pose2.x)**2 + (pose1.y - pose2.y)**2)# Distancia entre el líder y el seguidor
+    phi = m.atan2((pose1.x - pose2.x), (pose1.y - pose2.y)) # Ángulo entre el lider y el seguidor
+    phi = scale_angle(phi) #Escalamiento 
+
+    #Et = d * m.cos(phi) - dref * m.cos(phiref) #Error velocidad lineal seguidor
+    Et=(pose1.x - pose2.x) - dref*m.cos(phiref) #Error velocidad lineal seguidor
+    Ev = d*m.sin(phi) - dref*m.sin(phiref) #Error velocidad angular seguidor
+    Bji = theta1-theta2 #Àngulo entre el lìder y el seguidor
+    vi = vj *((m.cos(Bji-phiref))/m.cos(phiref)) + Et * Kv    #Velocidad lineal seguidor
+    wi = vj *((m.sin(Bji))/(dref * m.cos(phiref))) + Ev * Kw  # Velocidad angular seguidor
+    
+    #Impresiòn de velocidades para control 
+    if isNewData:
+        print("----------------")
+        print("Velocidad vi: ", vi)
+        print("Distancia:  ", d)
+        print("Velocidad wi: ", wi)
+
+    #Limitación velocidad lineal y angular
+    if vi>max_linear_velocity:
+        vi = max_linear_velocity
+    if wi>max_angular_velocity:
+        wi=max_angular_velocity
+    
+    #Publicación de velocidades. 
+    vel2.linear.x, vel2.linear.y, vel2.linear.z = vi, 0, 0
+    vel2.angular.x, vel2.angular.y, vel2.angular.z = 0, 0, wi
+        # rospy.loginfo("Linear Velocity: %f Angular Velocity:
+        # %\n",vel.linear.x,vel.angular.z)
+    pub2.publish(vel2)
+    return
+
+
+def callback1(data):
+    global pose_and_orient1
+    pose_and_orient1 = data
+    global isNewData
+    isNewData = True
+    return
+
+
+def callback2(data):
+    global pose_and_orient2
+    pose_and_orient2 = data
+    return
+
+
+def callback3(data):
+    global vj
+    # Velocidad del robot lider
+    vj = data.linear.x
+    return
+
+
+if __name__ == "__main__":
+	# initialize node and create publisher and subscriber
+    rospy.init_node('follower', anonymous=True)
+    pub2 = rospy.Publisher('robot2/cmd_vel', Twist, queue_size=10)
+    sub1 = rospy.Subscriber("robot1/odom", Odometry, callback1)
+    sub2 = rospy.Subscriber("robot2/odom", Odometry, callback2)
+    sub3 = rospy.Subscriber("robot1/cmd_vel", Twist, callback3)
+    rate = rospy.Rate(10)
+	
+    vel2 = Twist()
+    
+    pose_and_orient1 = Odometry()
+    pose_and_orient2 = Odometry()
+
+     #Definición de constantes 
+    Kw = 0.1    #Constante velocidad angular
+    phiref = 0  # Ángulo de referencia entre el lider y el seguidor 
+    dref = 0.5  # Distancia de referencia 
+    Kv = 0.8    # Constante de velocidad lineal 
+
+    while not rospy.is_shutdown():
+        auto_thread = Thread(target=auto,args=(pub2,))
+        auto_thread.start()
+        #auto(pub2)
+        #mode = input()
+        #if mode == 'e':
+        #    break;

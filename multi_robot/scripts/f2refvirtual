@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+import time
+import sys
+import rospy
+import numpy as np
+import math as m
+
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from threading import Thread
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+# Iniciación de variables
+max_linear_velocity = 0.2
+max_angular_velocity = 2.8
+
+
+LOG_FILE_DIR = '/home/rodrigo/catkin_ws/src/multi_robot/Data'
+
+def formacion (tipo):
+    
+    if tipo==1:  #Formacion Fila 
+        l_tipo=0.5
+        phi_tipo=m.pi/2
+        print('Formación Fila')
+    elif tipo==2: #Formacion COLUMNA
+        l_tipo=0.5
+        phi_tipo=m.pi
+        print('Formación Columna')
+    elif tipo==3: #Formacion diamante
+        l_tipo=0.5
+        phi_tipo=(3*m.pi)/4
+        print('Formación V3A - Diamante 4A')
+    return l_tipo,phi_tipo
+
+def derivada(var1, var2, current_time=None):
+    global sample_time, last_time, ultima_var1, isNewData, xdpp, ultima_var2, ydpp
+    current_time = current_time if current_time is not None else time.time()
+    delta_time = current_time - last_time
+
+    delta_var1 = var1 - ultima_var1
+    delta_var2 = var2 - ultima_var2
+
+    if (delta_time >= sample_time):
+        if delta_time > 0:
+            xdpp = delta_var1 / delta_time
+            ydpp = delta_var2 / delta_time 
+
+        last_time = current_time
+        ultima_var1 = var1
+        ultima_var2 = var2
+    return
+
+def auto(pub):
+    global pose_and_orient1, pose_and_orient2, rate, vel2, isNewData, vj, wj 
+    global ld, phid,  k1, k2, k3, xdpp, ydpp, tipo_formacion
+    global lider_pose_x, seguidorR2_pose_x, virtual_pose_x
+    global lider_pose_y, seguidorR2_pose_y, virtual_pose_y 
+    global lider_pose_yaw, seguidorR2_pose_yaw, virtual_pose_yaw
+    global seguidorR2_distancia, seguidorR2_angulo, virtual_distancia, virtual_angulo
+    global seguidorR2_distanciad, seguidorR2_angulod
+
+    isNewData = False
+    #---------------------------X Y THETA ROBOT LIDER --------------------------- 
+    pose1 = pose_and_orient1.pose.pose.position
+    orient1 = pose_and_orient1.pose.pose.orientation
+    _, _, yaw1 = euler_from_quaternion([orient1.x, orient1.y, orient1.z, orient1.w])
+    theta1 = yaw1
+
+    #------------------X Y THETA Vel lineal ROBOT SEGUIDOR ---------------------- 
+    pose2 = pose_and_orient2.pose.pose.position
+    orient2 = pose_and_orient2.pose.pose.orientation
+    _, _, yaw2 = euler_from_quaternion([orient2.x, orient2.y, orient2.z, orient2.w])
+    theta2 = yaw2
+    vi_real=pose_and_orient2.twist.twist.linear.x #Velocidad lineal del robot
+    wi_real=pose_and_orient2.twist.twist.angular.z #Velocidad angular del robot
+        
+    #--------------X Y y velocidad de Robot de referencia virtual----------------
+    xd = pose1.x + ld*np.cos(theta1+phid)
+    yd = pose1.y + ld*np.sin(theta1+phid)
+    xlp = vj*np.cos(theta1) #Velocidad en el eje cartesino x del robot lider 
+    ylp = vj*np.sin(theta1) #Velocidad en el eje cartesino y del robot lider 
+
+    xdp = xlp - ld*wj*(np.sin(theta1+phid))
+    ydp = ylp + ld*wj*np.cos(theta1+phid) 
+
+    derivada(xdp,ydp)
+
+    thetad = m.atan2(ydp,xdp)
+    
+    lvx = (xd-pose2.x)*np.cos(theta2) + (yd-pose2.y)*np.sin(theta2)
+    lvy = -(xd-pose2.x)*np.sin(theta2) + (yd-pose2.y)*np.cos(theta2)
+    elx = lvx
+    ely = lvy
+    et = theta2 - thetad
+
+    vd = xdp*np.cos(thetad)+ydp*np.sin(thetad)
+
+    if xdp!=0 or ydp!=0:
+        wd = (ydpp*xdp-xdpp*ydp)/(xdp**2+ydp**2)
+    else:
+        wd=0 
+
+
+    vi = k1*elx + vd*np.cos(et) #Velocidad lineal robot seguidir
+    wi = wd + k2*vd*(np.sin(et)/et)*ely - k3*et # Velocidad angular robot seguidor
+
+
+    if isNewData:
+        tipo_formacion = np.genfromtxt(LOG_FILE_DIR+'/tipo_formacion.csv', delimiter = ' , ')
+        ld, phid = formacion(tipo_formacion[0])
+        
+        #Calculo de distancia y angulo Lider seguidor
+        lx = (pose1.x - pose2.x)*np.cos(theta2) + (pose1.y - pose2.y)*np.sin(theta2)
+        ly = (pose1.y - pose2.y)*np.cos(theta2) - (pose1.x - pose2.x)*np.sin(theta2)
+        l = np.sqrt(lx**(2)+ly**(2)) #Distancia del robot seguidor respecto del líder
+        phi = m.pi - theta1 + np.arcsin((pose1.y - pose2.y)/l) #np.arctan(ly/lx)   #Àngulo en radianes
+
+        #Calculo de distancia y angulo Robot virtual
+        ldx = -(pose1.x - xd)*np.cos(theta1) - (pose1.y - yd)*np.sin(theta1)
+        ldy = (pose1.x - xd)*np.sin(theta1) - (pose1.y - yd)*np.cos(theta1)
+        lref = np.sqrt(ldx**(2)+ldy**(2)) #Distancia del robot seguidor respecto del líder
+        phiref = m.pi- np.arcsin(ldy/ld) #thetad #Àngulo en radianes #m.pi - np.arctan(ldx/ldy)    
+
+        print("--------------------")
+        print("ld: ", ld, "phid", phid)
+        print("lref: ", lref, "phiref", phiref)
+        print("l seguidor: ", l, "phi seguidor", phi)
+        
+        #Almacenamiento de datos
+        if not (pose2.x == 0 and pose2.y == 0):
+            #DATOS DEL ROBOT SEGUIDOR
+            seguidorR2_pose_x = np.append(seguidorR2_pose_x, pose2.x)
+            seguidorR2_pose_y = np.append(seguidorR2_pose_y, pose2.y)
+            seguidorR2_pose_yaw = np.append(seguidorR2_pose_yaw, theta2)
+            #DATOS DEL ROBOT VIRTUAL 
+            virtual_pose_x = np.append(virtual_pose_x, xd)
+            virtual_pose_y = np.append(virtual_pose_y, yd)
+            virtual_pose_yaw = np.append(virtual_pose_yaw, thetad)
+            #DATOS L-PHI DE FORMACION y referencia virtual
+            seguidorR2_distanciad = np.append(seguidorR2_distanciad, ld)
+            seguidorR2_angulod = np.append(seguidorR2_angulod, phid)
+            seguidorR2_distancia = np.append(seguidorR2_distancia, l)
+            seguidorR2_angulo = np.append(seguidorR2_angulo, phi)
+            virtual_distancia = np.append(virtual_distancia, lref)
+            virtual_angulo = np.append(virtual_angulo, phiref)
+
+
+        if not (pose1.x == 0 and pose1.y == 0):
+            #DATOS DEL ROBOT LIDER
+            lider_pose_x = np.append(lider_pose_x, pose1.x)
+            lider_pose_y = np.append(lider_pose_y, pose1.y)
+            lider_pose_yaw = np.append(lider_pose_yaw, theta1)
+
+    if vi>max_linear_velocity:
+        vi = max_linear_velocity
+    if vi< -max_linear_velocity:
+        vi = -max_linear_velocity 
+    if wi>max_angular_velocity:
+        wi=max_angular_velocity
+    if wi<-max_angular_velocity:
+        wi=-max_angular_velocity
+
+
+    vel2.linear.x, vel2.linear.y, vel2.linear.z = vi, 0, 0
+    vel2.angular.x, vel2.angular.y, vel2.angular.z = 0, 0, wi
+
+    pub2.publish(vel2)
+    return
+
+
+def callback1(data):
+    global pose_and_orient1
+    pose_and_orient1 = data
+    global isNewData
+    isNewData = True
+    return
+
+
+def callback2(data):
+    global pose_and_orient2
+    pose_and_orient2 = data
+    return
+
+
+def callback3(data):
+    global vj, wj 
+    vj = data.linear.x   # Velocidad lineal del robot lider
+    wj= data.angular.z   # Velocidad angular del robot lider
+    return
+
+
+if __name__ == "__main__":
+    #Inicialización de variables 
+    vj=0
+    wj=0
+
+    #Inicializar constantes derivada 
+    sample_time = 0.5
+    last_time = 0
+    ultima_var1 = 0
+    ultima_var2 = 0
+    xdpp=0 #Derivada xdp
+    ydpp=0 #Derivada ydp
+
+    #Declaraciòn constantes para control de velocidades 
+    k1 = 7.2 #6.5 #7.5 #7 #6   #8
+    k2 = 16.3 #17 #16.5 #13 #15  #15
+    k3 = 1.2 #2 #1.5 #0.8 #1   #5s
+
+    #Distancia y ángulo deseados de la formación
+    ld=0.5
+    phid=(1*m.pi)/2 #Formación fila 
+    
+    #Inicialización del nodo con publicadores y subscriptores 
+    rospy.init_node('followerR2')
+    pub2 = rospy.Publisher('robot2/cmd_vel', Twist, queue_size=10)
+    sub1 = rospy.Subscriber("robot1/odom", Odometry, callback1)
+    sub2 = rospy.Subscriber("robot2/odom", Odometry, callback2)
+    sub3 = rospy.Subscriber("robot1/cmd_vel", Twist, callback3)
+    rate = rospy.Rate(10)
+	
+    vel2 = Twist()
+    
+    pose_and_orient1 = Odometry()
+    pose_and_orient2 = Odometry()
+
+    # DECLARACIÓN DE VECTORES 
+    lider_pose_x = np.array([])
+    lider_pose_y = np.array([])
+    lider_pose_yaw = np.array([])
+    seguidorR2_pose_x = np.array([])
+    seguidorR2_pose_y = np.array([])
+    seguidorR2_pose_yaw = np.array([])
+    seguidorR2_distancia = np.array([])
+    seguidorR2_angulo = np.array([])
+    seguidorR2_distanciad = np.array([])
+    seguidorR2_angulod = np.array([])
+    virtual_pose_x = np.array([])
+    virtual_pose_y = np.array([])
+    virtual_pose_yaw = np.array([])
+    virtual_distancia = np.array([])
+    virtual_angulo = np.array([])
+    tipo_formacion = np.array([1, 1])
+
+    while not rospy.is_shutdown():
+        auto_thread = Thread(target=auto,args=(pub2,))
+        auto_thread.start()
+
+        if rospy.is_shutdown():
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_pose_x.csv', seguidorR2_pose_x, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_pose_y.csv', seguidorR2_pose_y, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_pose_yaw.csv', seguidorR2_pose_yaw, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_distancia.csv', seguidorR2_distancia, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_angulo.csv', seguidorR2_angulo, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_distanciad.csv', seguidorR2_distanciad, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR2_angulod.csv', seguidorR2_angulod, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/lider_pose_x.csv', lider_pose_x, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/lider_pose_y.csv', lider_pose_y, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/lider_pose_yaw.csv', lider_pose_y, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/virtual_pose_x.csv', virtual_pose_x, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/virtual_pose_y.csv', virtual_pose_y, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/virtual_pose_yaw.csv', virtual_pose_yaw, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/virtual_distancia.csv', virtual_distancia, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/virtual_angulo.csv', virtual_angulo, '%f', delimiter = ' , ')
+            print("------------------Datos guardados con éxito--------------------------------")
+

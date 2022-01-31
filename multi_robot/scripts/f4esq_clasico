@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+import time
+import sys
+import rospy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from threading import Thread
+
+# Other Imports
+import numpy as np
+import math as m
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+max_linear_velocity = 0.2
+max_angular_velocity = 2.8
+
+LOG_FILE_DIR = '/home/rodrigo/catkin_ws/src/multi_robot/Data'
+
+def formacion (tipo):
+    if tipo==1:  #FORMACIÓN FILA 
+        l_tipo=1.5
+        phi_tipo=-m.pi/2
+        print('Formación Fila')
+    elif tipo==2: #FORMACIÓN COLUMNA
+        l_tipo=1.5
+        phi_tipo=0
+        print('Formación Columna')
+    elif tipo==3: #FORMACIÓN DIAMANTE
+        l_tipo=1
+        phi_tipo=0
+        print('Formación Diamante')
+    return l_tipo,phi_tipo
+
+
+def auto(pub):
+    global pose_and_orient1, pose_and_orient2, rate, vel2, isNewData, vj, wj, wi 
+    global ld, phid,  k1, k2, k3, seguidorR4_pose_x, seguidorR4_pose_y, seguidorR4_pose_yaw
+
+    isNewData = False
+#------------------X Y THETA ROBOT LIDER ---------------------- 
+    pose1 = pose_and_orient1.pose.pose.position
+    orient1 = pose_and_orient1.pose.pose.orientation
+    _, _, yaw1 = euler_from_quaternion([orient1.x, orient1.y, orient1.z, orient1.w])
+    theta1 = yaw1
+
+    #------------------X Y THETA Vel lineal ROBOT SEGUIDOR ---------------------- 
+    pose2 = pose_and_orient2.pose.pose.position
+    orient2 = pose_and_orient2.pose.pose.orientation
+    _, _, yaw2 = euler_from_quaternion([orient2.x, orient2.y, orient2.z, orient2.w])
+    theta2 = yaw2
+    vi_real=pose_and_orient2.twist.twist.linear.x #Velocidad lineal del robot
+    wi_real=pose_and_orient2.twist.twist.angular.z
+        
+    #Cálculo de velocidades robot seguidor
+
+    ##Solo sirve paraur en linea recta--------------------SEGUIDOR NORMAL 
+    lx= (pose1.x-pose2.x)*np.cos(theta2) + (pose1.y-pose2.y)*np.sin(theta2)
+    ly= (pose1.y-pose2.y)*np.cos(theta2) - (pose1.x-pose2.x)*np.sin(theta2)
+    
+    ldx= ld* np.cos(phid)
+    ldy= ld* np.sin(phid)
+    
+    ##Cálculo de errores
+    elx = lx - ldx       #Eroor de distancia 
+    ely = ly - ldy
+    et = theta2-theta1 #Error de orientación = àngulo del seguidor - ángulo  del lider (radianes)
+    e1 = ldy*wi 
+    
+    ##Si velocidad del seguidor (vi) < delta----------------------------------------
+    vi = k1*elx + vj*np.cos(et)+e1 #Velocidad lineal robot seguidir
+    wi = wj + k2*vj*(np.sin(et)/et)*ely - k3*et # Velocidad angular robot seguidor
+
+    if isNewData:
+        tipo_formacion = np.genfromtxt(LOG_FILE_DIR+'/tipo_formacion.csv', delimiter = ' , ')
+        ld, phid = formacion(tipo_formacion[0])
+        print("----------------")
+        print("ld: ", ld, "phid", phid)
+        
+        if not (pose2.x == 0 and pose2.y == 0):
+            #ALMACENO LOS DATOS DEL ROBOT SEGUIDOR
+            seguidorR4_pose_x = np.append(seguidorR4_pose_x, pose2.x)
+            seguidorR4_pose_y = np.append(seguidorR4_pose_y, pose2.y)
+            seguidorR4_pose_yaw = np.append(seguidorR4_pose_yaw, theta2)
+            # Generación de errores para calibrar controladores 
+            l = np.sqrt(lx**(2)+ly**(2)) #Distancia del robot seguidor respecto del líder
+            phi = np.arcsin(ly/l) #Àngulo en radianes 
+            print("distancia seguidor:",l,"angulo seguidor:",phi )
+    
+    # ------------- Limito las velocidades del robot seguidor ---------------
+    if vi>max_linear_velocity:
+        vi = max_linear_velocity
+    if vi< -max_linear_velocity:
+        vi = -max_linear_velocity 
+    if wi>max_angular_velocity:
+        wi=max_angular_velocity
+    if wi<-max_angular_velocity:
+        wi=-max_angular_velocity
+
+    #------------------------- Escribo las velocidades sobre el robot seguidor-----------------
+    vel2.linear.x, vel2.linear.y, vel2.linear.z = vi, 0, 0
+    vel2.angular.x, vel2.angular.y, vel2.angular.z = 0, 0, wi
+    pub2.publish(vel2)
+    return
+
+
+def callback1(data):
+    global pose_and_orient1
+    pose_and_orient1 = data
+    global isNewData
+    isNewData = True
+    return
+
+
+def callback2(data):
+    global pose_and_orient2
+    pose_and_orient2 = data
+    return
+
+
+def callback3(data):
+    global vj, wj 
+    vj = data.linear.x   # Velocidad lineal del robot lider
+    wj= data.angular.z   # Velocidad angular del robot lider
+    return
+
+
+if __name__ == "__main__":
+	
+    vj=0
+    wj=0
+    wi=0
+    # initialize node and create publisher and subscriber
+    rospy.init_node('followerR4')
+    pub2 = rospy.Publisher('robot4/cmd_vel', Twist, queue_size=10)
+    sub1 = rospy.Subscriber("robot1/odom", Odometry, callback1)
+    sub2 = rospy.Subscriber("robot4/odom", Odometry, callback2)
+    sub3 = rospy.Subscriber("robot1/cmd_vel", Twist, callback3)
+    rate = rospy.Rate(10)
+	
+    vel2 = Twist()
+    
+    pose_and_orient1 = Odometry()
+    pose_and_orient2 = Odometry()
+
+    # DECLARACIÓN DE VECTORES 
+    seguidorR4_pose_x = np.array([])
+    seguidorR4_pose_y = np.array([])
+    seguidorR4_pose_yaw = np.array([])
+    #INICIALIZACIÒN DE CONSTANTES
+    ld=1.5
+    phid=-m.pi/2 
+    tipo_formacion=np.array([1,1])
+
+    #Declaraciòn constantes seguimiento de variables: 
+    k1 = 3
+    k2 = 8
+    k3 = 1
+
+    while not rospy.is_shutdown():
+        auto_thread = Thread(target=auto,args=(pub2,))
+        auto_thread.start()
+
+        if rospy.is_shutdown():
+            np.savetxt(LOG_FILE_DIR+'/seguidorR4_pose_x.csv', seguidorR4_pose_x, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR4_pose_y.csv', seguidorR4_pose_y, '%f', delimiter = ' , ')
+            np.savetxt(LOG_FILE_DIR+'/seguidorR4_pose_yaw.csv', seguidorR4_pose_yaw, '%f', delimiter = ' , ')
+            vel2.linear.x, vel2.linear.y, vel2.linear.z = 0, 0, 0
+            vel2.angular.x, vel2.angular.y, vel2.angular.z = 0, 0, 0
+            pub2.publish(vel2)
+            print("VALIOOOOOO--------------------------------------")
+
